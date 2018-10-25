@@ -16,7 +16,7 @@ from pygame_control import Control
 from resources import *
 
 #number of samples to process
-points=128
+points=100
 
 #global physics parmeters
 damping = 0.9995
@@ -51,7 +51,7 @@ wave1['mask'][-1] = 1
 kernel_width = 20
 kernel_depth = 20
 kernel1 = sgn.gaussian(1+kernel_width*2,2)
-kernel1 = kernel1/kernel1.sum()
+#kernel1 = kernel1/kernel1.sum()
 
 kernel2 = sgn.gaussian(1+kernel_width*2,1)
 kernel2 = kernel2/kernel2.sum()
@@ -84,19 +84,26 @@ def initWaveRender(wave, points):
         wave1['raux'].append(ar)
 
 def resize_kernel(width, depth, points):
+    print("a: ",width,depth)
+    width, depth = float(width), float(depth)
+    print("b: ",width,depth)
     kw = max(min(width,1)*points,3)
-    if int(points/2):
-        kw = points
+    print("c: ",kw,int(kw/2)-kw/2)
+    if int(kw/2)-kw/2:
+        kw = kw
     else:
-        kw = points-1
+        kw = kw-1
+    
+    kw = int(kw)
     kd = max(min(1,depth) * kw,0.5)
-
-    kernel2 = sgn.gaussian(kw,kd)
-    kernel2 = kernel2/kernel2.sum()
-    print("kd,kw: ",kd,kw)
-
+    kernel = sgn.gaussian(kw,kd)
+    kernel = kernel/kernel.sum()
+    print("d: ", kd,kw)
+    print(kernel.shape)
+    return kernel
     
 def resampleWave(wave, points):
+    global kernel1, kernel2
     mval =  wave['tar'][:,0].size / points
     wave['tar'] = sgn.resample(wave['tar'], points)
     
@@ -106,11 +113,12 @@ def resampleWave(wave, points):
     wave['mask']= np.zeros(shape=(points,1),dtype=float)
     wave['mask'][0] = 1
     wave['mask'][-1] = 1
-    resize_kernel(kernel_width/100, kernel_depth/100, points)
-    
-
-def lerp(x, y, a):
-    return (x-y)*a + y
+    kernel1 = resize_kernel(kernel_width/100.0, kernel_depth/100.0, points)
+    kernel2 = resize_kernel(kernel_width/400.0, kernel_depth/100.0, points)
+    print(kernel1.shape,kernel2.shape)
+#       to, from amount
+def lerp(to, frm, amt):
+    return (to-frm)*amt + frm
 """
 xa +y(1-a)
 xa -y(a-1)
@@ -118,11 +126,36 @@ xa -ay + y
 (x-y)a +y
 """
 
+#attempt to blend val into targ using src as an alpha mask centred on offset
+def blend_at(targ, src, offset, val, axis=0):
+    print(targ.shape,src.shape)
+    #get the offset for the filter
+    src_start = int(offset - src.shape[axis]/2)
+    src_end = int(offset + src.shape[axis]/2)
+    #print("bf src start/end: ",(src_start, src_end))
+    #trim the filter if starting off the end
+    if src_start < 0:
+        src = src[-src_start:]
+        src_start = 0
+    #trim the end
+    if src_end > targ.shape[axis]:
+        src = src[:targ.shape[axis]-src_end]
+        src_end = targ.shape[axis]
+    
+    #print("af src start/end: ",(src_start, src_end))
+    val = np.full_like(src,val)
+    
+    #print("bf targ[start:end]: ",targ[src_start:src_end])
+    targ[src_start:src_end] = lerp(val,targ[src_start:src_end],src)
+    #print("af targ[start:end]: ",targ[src_start:src_end])
+    return (src_start, src_end)
+
+
 times = {}
 #macro for limiting event occurence
 def timer(stamp_name, rate=1000):
     time = t.get_ticks()
-    if (time-times[stamp_name]) > rate:
+    if rate > 0 and (time-times[stamp_name]) > rate:
         times[stamp_name] = time
         return True
     return False
@@ -130,6 +163,7 @@ def timer(stamp_name, rate=1000):
 #timer for tracking things like print repeat intervals
 times['touch_printer'] = t.get_ticks()
 times['param_printer'] = t.get_ticks()
+times['debug_printer'] = t.get_ticks()
 
 
 def getButtonColors(hue):
@@ -175,7 +209,7 @@ def changeParam(vid, var):
         force = max(0,min(force, 2))
         new_val = force
     if timer('param_printer', rate=100):
-        print(new_val, var)
+        print(vid, ": ",new_val, var)
         msg.showValue(vid, new_val)
 
 #function to quite on button press
@@ -210,7 +244,7 @@ initWaveRender(wave1, points)
 #varibles for tracking selection of points
 touched = False
 touch_id = 0
-
+touch_range = (0,0)
 
 run_simulation = True
 #--------------------------- main loop
@@ -260,20 +294,34 @@ while True:
     
     #process wave sample manipulation
     if touched:
+        #get the position of the touched wave element
         pos = wave1['pos'][touch_id]
+        #get the relative motion
         vel = ms.get_rel()
+        #add rge relative motion to the point
         pos = pos+vel
+        #lock horizontal posituin
         pos[0] = wave1['tar'][touch_id,0]
-        wave1['pos'][touch_id] = pos
-        wave1['vel'][touch_id][1] = lerp(vel[0], wave1['vel'][touch_id][1],0.5)
+        #write in the new value
+        #wave1['pos'][touch_id] = pos
+        blend_at(wave1['pos'][:,1],kernel1,touch_id,pos[1])
+        #bend in the velocity
+        #wave1['vel'][touch_id][1] = lerp(vel[0], wave1['vel'][touch_id][1],0.5)
+        blend_at(wave1['vel'][:,1],kernel2,touch_id,vel[1])
+        #lock horizontal velocity
         wave1['vel'][touch_id][0] = 0
         #print("id:",touch_id," x:",pos[0]," y:",pos[1])
 
     if run_simulation:
-        #calculate accelerations
+        if timer('debug_printer',0):
+            print ( "POS/KRN LEN: ",len(wave1['pos']), len(kernel2 ))
+
+
+        #calculate mean centre of force
         wave1['acc'].fill(0)
         wave1['tar'][:,1] = np.correlate(wave1['pos'][:,1], kernel2, mode='same')
         
+        #process boundary conditions
         wave1['tar'][-1,1] = lerp(wave1['tar'][-1,1],0,end_damping[1])
         wave1['tar'][0,1] = lerp(wave1['tar'][-0,1],0,end_damping[0])
         '''
@@ -284,13 +332,14 @@ while True:
             wave1['acc'][n] = wave1['acc'][n]+dd
             wave1['acc'][n-1] = wave1['acc'][n-1]-dd
         '''
-        #process boundary conditions
-        wave1['acc'] = wave1['acc']+(wave1['tar'] - wave1['pos']) * force# * wave1['mask']
+        #calculate accelerations
+        wave1['acc'] = wave1['acc']+(wave1['tar'] - wave1['pos']) * force/wave1['acc'].shape[0]# * wave1['mask']
             
         #integrate motion parameters
         wave1['vel'] = wave1['vel'] + wave1['acc']
         wave1['vel'] = wave1['vel'] * damping
         wave1['pos'] = wave1['pos'] + wave1['vel']
+        wave1['pos'][:,1] = np.correlate(wave1['pos'][:,1], kernel2, mode='same')
         wave1['pos'] = np.clip(wave1['pos'],-10000,10000)
     #calculate aux data
     aux_val = wave1['tar'][:,1]
